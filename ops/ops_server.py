@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["mcp>=1.2,<2", "httpx", "uvicorn"]
+# dependencies = ["mcp>=1.10,<2", "httpx", "uvicorn"]
 # ///
 """Ops MCP server: the only door agents use to touch GitHub, the VPS and Thor.
 
@@ -29,7 +29,9 @@ STATE = Path(os.environ.get("OPS_STATE", "approvals.json"))
 REPOS = {r.strip() for r in os.environ.get("OPS_ALLOWED_REPOS", "").split(",") if r.strip()}
 HEALTH = dict(h.split("=", 1) for h in os.environ.get("OPS_HEALTH_URLS", "").split(",") if "=" in h)
 
-mcp = FastMCP("ops", host="0.0.0.0", port=int(os.environ.get("PORT", "8790")))
+# stateless + json_response: one plain JSON-RPC POST per call, no session handshake, no SSE
+mcp = FastMCP("ops", host="0.0.0.0", port=int(os.environ.get("PORT", "8790")),
+              stateless_http=True, json_response=True)
 
 
 def _gh(method: str, path: str, **kw):
