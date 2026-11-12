@@ -13,8 +13,7 @@ Env: GITHUB_TOKEN, OPS_AGENT_TOKEN, CHAIRMAN_TOKEN, OPS_ALLOWED_REPOS
 (comma list of owner/name), OPS_HOSTS ("vps=root@1.2.3.4,thor=vikash191@100.x"),
 OPS_STATE (approvals file, default ./approvals.json), PORT (default 8790).
 """
-import json, os, re, time
-from pathlib import Path
+import os, re, time
 
 import anyio
 import httpx
@@ -28,7 +27,6 @@ logging.getLogger("httpx").setLevel(logging.WARNING)  # its INFO line prints the
 import trader_job
 
 GH = "https://api.github.com"
-STATE = Path(os.environ.get("OPS_STATE", "approvals.json"))
 REPOS = {r.strip() for r in os.environ.get("OPS_ALLOWED_REPOS", "").split(",") if r.strip()}
 HEALTH = dict(h.split("=", 1) for h in os.environ.get("OPS_HEALTH_URLS", "").split(",") if "=" in h)
 
@@ -51,25 +49,9 @@ def _repo(repo: str) -> str:
     return repo
 
 
-def _load() -> dict:
-    return json.loads(STATE.read_text()) if STATE.exists() else {}
-
-
-def _save(d: dict) -> None:
-    STATE.write_text(json.dumps(d, indent=1))
-
-
-def _telegram(text: str, repo: str, pr: int) -> bool:
-    """Sends the approval prompt with Approve/Reject buttons. False if not configured."""
-    tok, chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
-    if not (tok and chat):
-        return False
-    key = f"{repo}#{pr}"  # callback_data is capped at 64 bytes
-    kb = {"inline_keyboard": [[{"text": "Approve", "callback_data": f"a|{key}"},
-                               {"text": "Reject", "callback_data": f"r|{key}"}]]}
-    r = httpx.post(f"https://api.telegram.org/bot{tok}/sendMessage", timeout=15,
-                   json={"chat_id": chat, "text": text, "reply_markup": kb})
-    return r.status_code == 200
+# PR approvals and trade tickets share OPS_STATE; every read-modify-write goes through
+# trader_job._state (file lock + atomic replace), so /tg, cron and the MCP tools cannot race.
+_state = trader_job._state
 
 
 @mcp.tool()
@@ -93,10 +75,12 @@ def request_merge(repo: str, pr: int, summary: str) -> dict:
     """Asks the chairman to approve merging this PR. Returns the pending request;
     the chairman is told out of band. Call merge_pr only after approval."""
     sha = _gh("GET", f"/repos/{_repo(repo)}/pulls/{pr}")["head"]["sha"]
-    d = _load()
-    d[f"{repo}#{pr}"] = {"sha": sha, "summary": summary, "status": "pending", "at": time.time()}
-    _save(d)
-    notified = _telegram(f"Merge request {repo}#{pr}\n{summary}\nsha {sha[:8]}", repo, pr)
+    key = f"{repo}#{pr}"
+    with _state() as d:
+        rec = d[key] = {"sha": sha, "summary": summary, "status": "pending", "at": time.time(),
+                        **trader_job.new_nonces()}
+    kb = trader_job.buttons(key, rec)  # None if callback_data would pass 64 bytes: not sent
+    notified = bool(kb) and trader_job.tg_send(f"Merge request {key}\n{summary}\nsha {sha[:8]}", kb)
     return {"status": "pending", "sha": sha, "notified": notified,
             "note": "waiting for chairman approval"}
 
@@ -104,7 +88,8 @@ def request_merge(repo: str, pr: int, summary: str) -> dict:
 @mcp.tool()
 def merge_pr(repo: str, pr: int) -> dict:
     """Squash-merges a PR only if the chairman approved its current head SHA."""
-    rec = _load().get(f"{_repo(repo)}#{pr}")
+    with _state() as d:
+        rec = d.get(f"{_repo(repo)}#{pr}")
     if not rec or rec["status"] != "approved":
         return {"merged": False, "reason": "no chairman approval"}
     sha = _gh("GET", f"/repos/{repo}/pulls/{pr}")["head"]["sha"]
@@ -180,35 +165,46 @@ async def approve(request: Request):
     if request.headers.get("authorization") != f"Bearer {os.environ['CHAIRMAN_TOKEN']}":
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     b = await request.json()
-    d = _load()
-    rec = d.get(f"{b['repo']}#{b['pr']}")
+    with _state() as d:
+        rec = d.get(f"{b['repo']}#{b['pr']}")
+        if rec:
+            rec["status"] = "approved" if b.get("decision") == "approve" else "rejected"
     if not rec:
         return JSONResponse({"error": "no pending request"}, status_code=404)
-    rec["status"] = "approved" if b.get("decision") == "approve" else "rejected"
-    _save(d)
     return JSONResponse({"ok": True, "status": rec["status"], "sha": rec["sha"]})
 
 
 @mcp.custom_route("/tg", methods=["POST"])
 async def telegram_webhook(request: Request):
-    """Telegram button presses. Accepted only with the webhook secret header and
-    only from TELEGRAM_CHAT_ID. Set up: setWebhook url=<public>/tg secret_token=$TG_WEBHOOK_SECRET."""
+    """Telegram button presses, forwarded unchanged by the ProjectNexus CEO (which owns the
+    bot's long poll; no webhook is registered). Accepted only with the secret header
+    (TG_WEBHOOK_SECRET), only from TELEGRAM_CHAT_ID, and only when callback_data
+    "a|<key>|<nonce>" carries the nonce stored for that verb. Anything else: 200, no change."""
     if request.headers.get("x-telegram-bot-api-secret-token") != os.environ["TG_WEBHOOK_SECRET"]:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
+    ok = JSONResponse({"ok": True})
     cb = (await request.json()).get("callback_query")
     if not cb or str(cb["message"]["chat"]["id"]) != os.environ["TELEGRAM_CHAT_ID"]:
-        return JSONResponse({"ok": True})
-    verb, key = cb["data"].split("|", 1)
-    if key.startswith("T:"):  # trade ticket: Approve is the only path to an order
-        fn = trader_job.place_ticket if verb == "a" else trader_job.reject_ticket
+        return ok
+    parts = (cb.get("data") or "").split("|")
+    if len(parts) != 3 or parts[0] not in ("a", "r"):
+        return ok
+    verb, key, nonce = parts
+    with _state() as d:
+        rec = d.get(key)
+        valid = trader_job.nonce_ok(rec, verb, nonce)
+        if valid and not key.startswith("T:") and rec.get("status") == "pending":
+            rec["status"] = "approved" if verb == "a" else "rejected"
+    if not (valid and key.startswith("T:")):
+        return ok
+    # trade ticket: Approve is the only path to an order
+    fn = trader_job.place_ticket if verb == "a" else trader_job.reject_ticket
+    try:
         out = await anyio.to_thread.run_sync(fn, key)
-        await anyio.to_thread.run_sync(trader_job.tg_send, out)
-        return JSONResponse({"ok": True})
-    d = _load()
-    if key in d and d[key]["status"] == "pending":
-        d[key]["status"] = "approved" if verb == "a" else "rejected"
-        _save(d)
-    return JSONResponse({"ok": True})
+    except Exception as e:  # the chairman must learn the tap's outcome is unknown
+        out = f"Error on {key}: {type(e).__name__}. Check trading_status before acting."
+    await anyio.to_thread.run_sync(trader_job.tg_send, out)
+    return ok
 
 
 def app():

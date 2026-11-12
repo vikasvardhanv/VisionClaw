@@ -13,7 +13,7 @@ Env: ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL (paper only),
 TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, OPS_STATE, TRADER_DIR, TRADER_SYMBOLS,
 SEC_USER_AGENT (optional), DTS_DIR (default /opt/dts).
 """
-import fcntl, json, os, re, shutil, subprocess, sys, time
+import fcntl, json, os, re, secrets, shutil, subprocess, sys, time
 from contextlib import contextmanager
 from datetime import datetime, time as dtime
 from pathlib import Path
@@ -98,17 +98,37 @@ def _get(path: str, **kw):
     return r.json()
 
 
-def tg_send(text: str, ticket_id: str = "") -> bool:
-    """Plain-text Telegram message, with Approve/Reject buttons when ticket_id is given.
+def new_nonces() -> dict:
+    """Fresh per-verb nonces for a record. A tap counts only if its callback_data carries the
+    stored nonce, so holding the webhook secret is not enough to forge an Approve."""
+    return {"nonce_a": secrets.token_hex(6), "nonce_r": secrets.token_hex(6)}
+
+
+def buttons(key: str, rec: dict) -> dict | None:
+    """Approve/Reject keyboard "a|<key>|<nonce_a>" / "r|<key>|<nonce_r>".
+    None when either callback_data exceeds Telegram's 64-byte cap: the caller must not send."""
+    a, r = f"a|{key}|{rec['nonce_a']}", f"r|{key}|{rec['nonce_r']}"
+    if max(len(a.encode()), len(r.encode())) > 64:
+        return None
+    return {"inline_keyboard": [[{"text": "Approve", "callback_data": a},
+                                 {"text": "Reject", "callback_data": r}]]}
+
+
+def nonce_ok(rec: dict | None, verb: str, nonce: str) -> bool:
+    """True only when the tap's nonce equals the one stored for that verb."""
+    want = (rec or {}).get(f"nonce_{verb}")
+    return bool(want) and secrets.compare_digest(want, nonce)
+
+
+def tg_send(text: str, markup: dict | None = None) -> bool:
+    """Plain-text Telegram message, with an inline keyboard when markup is given.
     Never raises and never prints: the URL holds the bot token."""
     tok, chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
     if not (tok and chat):
         return False
     body = {"chat_id": chat, "text": text[:4000]}
-    if ticket_id:
-        body["reply_markup"] = {"inline_keyboard": [[
-            {"text": "Approve", "callback_data": f"a|{ticket_id}"},
-            {"text": "Reject", "callback_data": f"r|{ticket_id}"}]]}
+    if markup:
+        body["reply_markup"] = markup
     try:
         return HTTP.post(f"https://api.telegram.org/bot{tok}/sendMessage", json=body).status_code == 200
     except httpx.HTTPError:
@@ -324,18 +344,29 @@ def propose(notify_none: bool = True) -> str:
     with _state() as d:
         tid = f"T:{_now():%Y%m%d}-{len(_today_tickets(d)) + 1}"
         summary = f"{t['plain']}\nwhy: {t['why']}"
-        d[tid] = {"kind": "trade", "index": t["index"], "fingerprint": t["fingerprint"],
-                  "order": rest_order(t["tool_input"], tid), "summary": summary,
-                  "status": "pending", "at": time.time()}
-    sent = tg_send(f"Paper trade ticket {tid}\n{summary}\nRisk check: PASS. "
-                   f"Approve within 10 minutes to place it on the paper account.", tid)
+        rec = d[tid] = {"kind": "trade", "index": t["index"], "fingerprint": t["fingerprint"],
+                        "order": rest_order(t["tool_input"], tid), "summary": summary,
+                        "status": "pending", "at": time.time(), **new_nonces()}
+    kb = buttons(tid, rec)
+    sent = bool(kb) and tg_send(f"Paper trade ticket {tid}\n{summary}\nRisk check: PASS. "
+                                f"Approve within 10 minutes to place it on the paper account.", kb)
     return f"Ticket {tid} {'sent' if sent else 'NOT sent (Telegram unavailable)'}: {t['plain']}"
 
 
 def flatten() -> str:
     """Exits only reduce risk, so no tap is needed: cancel every open order, close every position.
     Alpaca answers 207 with a status per symbol; a failed close is reported, and anything still
-    held after the closes had time to fill raises an ALERT in Telegram."""
+    held after the closes had time to fill raises an ALERT in Telegram. Any exception (the
+    DELETE itself, a non-paper URL, the account read) still sends an ALERT."""
+    try:
+        return _flatten()
+    except Exception as e:
+        text = f"ALERT: flatten failed ({type(e).__name__}). Close positions by hand."
+        tg_send(text)
+        return text
+
+
+def _flatten() -> str:
     r = alpaca("DELETE", "/v2/positions", params={"cancel_orders": "true"})
     r.raise_for_status()
     results = r.json() or []
@@ -389,7 +420,9 @@ def main(argv: list[str]) -> int:
     if not in_window(argv[1], now):
         print(f"{now:%Y-%m-%d %H:%M} ET: outside the {argv[1]} window {'/'.join(SLOTS[argv[1]])}, skipping.")
         return 0
-    if not trading_day():
+    # flatten skips the calendar: cancelling and closing is harmless on a holiday, and a failed
+    # calendar call must not leave a position open overnight
+    if argv[1] != "flatten" and not trading_day():
         print(f"{now:%Y-%m-%d %H:%M} ET: no trading session today, skipping {argv[1]}.")
         return 0
     print(f"{_now():%Y-%m-%d %H:%M} ET {argv[1]}: {jobs[argv[1]]()}")

@@ -17,8 +17,9 @@ Single door for agents to reach GitHub, the VPS and Thor. Fixed tools, no raw sh
 ## Approval flow
 
 1. Agent pushes a branch and calls `open_pr`, then `request_merge`.
-2. Chairman approves out of band: `POST /approve` with `Authorization: Bearer $CHAIRMAN_TOKEN` and `{"repo","pr","decision":"approve"}`.
-3. Agent calls `merge_pr`. A push after approval changes the SHA and voids it.
+2. `request_merge` sends the chairman a Telegram message with Approve/Reject buttons.
+3. Chairman taps Approve. As a fallback, the chairman can `POST /approve` with `Authorization: Bearer $CHAIRMAN_TOKEN` and `{"repo","pr","decision":"approve"}`.
+4. Agent calls `merge_pr`. A push after approval changes the SHA and voids it.
 
 `OPS_AGENT_TOKEN` (the MCP bearer) cannot call `/approve`. Keep the two secrets separate.
 
@@ -36,7 +37,7 @@ Stateless JSON-RPC: one `POST /mcp` with `Authorization: Bearer $OPS_AGENT_TOKEN
 
 ## Status
 
-- Deployed at `https://ops.76-13-124-154.sslip.io`. The Telegram webhook (`/tg`) is registered. Env also needs `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `TG_WEBHOOK_SECRET`.
+- Deployed at `https://ops.76-13-124-154.sslip.io`. No Telegram webhook is registered. Button presses arrive on `/tg` through the ProjectNexus CEO forwarder (see Deploy).
 - Not registered in `gateway/src/apps.ts` or in Viktron's agent tools.
 - `check_url` cannot judge client-rendered features; that needs a browser step.
 - Verified locally: auth gates, the no-approval merge refusal, `/approve`, and the Telegram webhook (foreign chat ignored, no flip after approval). Not verified: real GitHub calls (the token in `.sops.env` is dead), SSH from the server.
@@ -67,7 +68,7 @@ If a close fails, or a position is still open after the flatten, the Telegram li
 ### Three gates before an order
 
 1. **Risk PASS.** `check.py` must pass the exact order. If not, no ticket is sent.
-2. **Chairman tap.** Only the Telegram webhook (`/tg`) places an order. The press must pass the secret header and come from `TELEGRAM_CHAT_ID`. No MCP tool places, approves or cancels an order.
+2. **Chairman tap.** Only the `/tg` handler places an order. The press must pass the secret header, come from `TELEGRAM_CHAT_ID`, and carry the ticket's Approve nonce. No MCP tool places, approves or cancels an order.
 3. **Paper URL.** `place_ticket` refuses unless the `ALPACA_BASE_URL` host is exactly `paper-api.alpaca.markets`. There is no live switch in code.
 
 A ticket expires **10 minutes** after it is sent. An Approve after that is refused and reported in the chat. A second tap on the same ticket is refused.
@@ -89,3 +90,44 @@ The limits live in `$TRADER_DIR/trader/config.json` on the `/data` volume. The j
 3. Keep `max_order_usd` at or under the budget. Keep `paper` true.
 
 The digest's budget line reads from this file, so the next morning message shows the new limits.
+
+## Deploy
+
+### How button presses reach the ops server
+
+The ops server and the ProjectNexus CEO (`coolify_deploy/telegram_worker.py`) share one Telegram bot. The CEO long-polls that bot, and Telegram refuses a long poll while a webhook is set. So the ops server holds no webhook. The CEO deletes any webhook at boot. When a press has `callback_data` that starts with `a|` or `r|`, the CEO sends the raw update JSON to `/tg` with the header `X-Telegram-Bot-Api-Secret-Token`.
+
+While the CEO restarts, nobody polls the bot, and taps made in that time are lost. A lost tap on a trade ticket does no harm: the ticket expires after 10 minutes. Tap again on a merge request, or call `request_merge` again.
+
+### Tap nonces
+
+Each Approve/Reject keyboard carries a fresh random nonce per verb (`a|<key>|<nonce_a>`, `r|<key>|<nonce_r>`), stored only in `OPS_STATE`. `/tg` acts only when the nonce matches, so the webhook secret alone (which the CEO's LLM can reach) cannot forge a tap, and no MCP tool returns a nonce.
+
+`callback_data` must be 64 bytes or less. If a key is too long, the server does not send the buttons (`notified: false`). A record made before nonces existed cannot be approved by a tap. Call `request_merge` again.
+
+### Env that must match ProjectNexus
+
+| Ops server | ProjectNexus CEO | Rule |
+|---|---|---|
+| `TG_WEBHOOK_SECRET` | `OPS_TG_SECRET` | Must be set and identical. |
+| `OPS_AGENT_TOKEN` | `OPS_AGENT_TOKEN` | Identical. |
+| (public URL) | `OPS_MCP_URL` | `https://ops.76-13-124-154.sslip.io/mcp` |
+| `TELEGRAM_BOT_TOKEN` | `TELEGRAM_BOT_TOKEN` | The shared bot. |
+| `TELEGRAM_CHAT_ID` | `TELEGRAM_CHAT_ID` | The chairman's chat. The CEO ignores every other chat. |
+
+Trading env on the ops server: `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `ALPACA_BASE_URL` (`https://paper-api.alpaca.markets`), and optionally `TRADER_SYMBOLS` (see Trading > Env).
+
+### Container
+
+- The compose service keeps `container_name: ops-mcp`. The crontab calls `docker exec ops-mcp`.
+- The service keeps the `/data` volume. `OPS_STATE` (`/data/approvals.json`) and `TRADER_DIR` (`/data/trader-home`) live on it.
+
+### Host and crontab
+
+The host must run in UTC. The crontab times are UTC.
+
+1. Examine the host clock: `timedatectl`. The time zone must be `Etc/UTC`.
+2. Copy `ops/crontab` to the host.
+3. Install the file: `crontab ops/crontab` as a user that can run `docker exec`. This replaces that user's crontab, so merge any existing lines first.
+4. Make sure that the entries are present: `crontab -l`.
+5. Make sure that `/var/log/ops-trader.log` is writable by that user.
