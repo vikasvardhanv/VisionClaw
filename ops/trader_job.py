@@ -25,6 +25,10 @@ import httpx
 NY = ZoneInfo("America/New_York")
 PAPER_HOST = "paper-api.alpaca.markets"
 EXPIRY_S = 600
+STALE_MIN = 10  # an ORB trigger older than this is a different trade
+# New York slots per job. Cron fires in UTC for both EDT and EST; main() runs only within WINDOW_MIN of a slot.
+SLOTS = {"morning": ("08:45",), "propose": ("10:00", "10:30"), "flatten": ("15:55",)}
+WINDOW_MIN = 10
 SYMBOLS = ("F,SOFI,T,PFE,INTC,SNAP,AAL,CCL,RIVN,LCID,KMI,VZ,BAC,WBD,NU,HBAN,KEY,GRAB,PLUG,NIO,"
            "KVUE,CMCSA,HPE,UBER")
 HTTP = httpx.Client(timeout=20)  # tests swap in an httpx.MockTransport client
@@ -111,9 +115,10 @@ def tg_send(text: str, ticket_id: str = "") -> bool:
         return False
 
 
-def trading_day() -> bool:
+def trading_day() -> dict | None:
+    """Today's calendar row ({"date", "open", "close"}), or None when there is no session."""
     d = _now().date().isoformat()
-    return any(c.get("date") == d for c in _get("/v2/calendar", params={"start": d, "end": d}))
+    return next((c for c in _get("/v2/calendar", params={"start": d, "end": d}) if c.get("date") == d), None)
 
 
 # ---------------------------------------------------------------- ticket records (OPS_STATE)
@@ -255,11 +260,17 @@ def morning() -> str:
     return text
 
 
+def _age_min(at: str, now: datetime) -> float:
+    """Minutes since a scanner clock label like "10:15 AM" (New York, today)."""
+    t = datetime.strptime(at, "%I:%M %p").time()
+    return (now - datetime.combine(now.date(), t, NY)).total_seconds() / 60
+
+
 def propose(notify_none: bool = True) -> str:
     """One proposal attempt. Sends a ticket with buttons, or on the last run (10:30)
     a one-line "No trade today". Returns what happened either way."""
-    cfg = _cfg()
-    final = _now().time() >= dtime(10, 25)
+    cfg, now = _cfg(), _now()
+    final = now.time() >= dtime(10, 25)
 
     def none(reason: str) -> str:
         msg = f"No trade today: {reason}"
@@ -267,6 +278,11 @@ def propose(notify_none: bool = True) -> str:
             tg_send(msg)
         return msg
 
+    day = trading_day()
+    if not day:
+        return none("no trading session today")
+    if day.get("close") != "16:00":  # the bracket's day legs would end before the 15:55 flatten
+        return none(f"early close at {day.get('close')}, no entries on a short session")
     with _state() as d:
         today = _today_tickets(d)
     placed = sum(1 for r in today.values() if r["status"] in ("placed", "placing"))
@@ -278,18 +294,24 @@ def propose(notify_none: bool = True) -> str:
     rc, out, err = _run("trader-scanner/scan.py", "orb", "--watchlist", "trader/watchlist.json",
                         "--out", "trader/orb.json", "--json")
     orb = _json(out)
-    hits = [h for h in (orb or {}).get("hits", []) if h["price"] <= cfg["max_order_usd"]]
+    hits = [h for h in (orb or {}).get("hits", []) if h["price"] <= cfg["max_order_usd"]
+            and _age_min(h["at"], now) <= STALE_MIN]
     if not hits:
-        why = _last(err) if orb is None else f"{len(orb.get('hits', []))} breakout(s), none priced in"
-        return none(f"no opening-range breakout at or under ${cfg['max_order_usd']} ({why})")
+        why = _last(err) if orb is None else \
+            f"{len(orb.get('hits', []))} breakout(s), none priced in and under {STALE_MIN} minutes old"
+        return none(f"no fresh opening-range breakout at or under ${cfg['max_order_usd']} ({why})")
     sym = hits[0]["symbol"]
     rc, out, err = _run("trader-entry/entry.py", "check", sym, "--write", "--json")
+    ent = _json(out) or {}
     if rc != 0:
-        return none(f"{sym} entry {(_json(out) or {}).get('status') or _last(err, out)}")
+        return none(f"{sym} entry {ent.get('status') or _last(err, out)}")
+    if ent.get("minutes_since", 0) > STALE_MIN:
+        return none(f"{sym} triggered {ent['minutes_since']} minutes ago, too late to enter")
     rc, out, err = _run("trader-exit/exit.py", "plan", "--write")
     if rc != 0:
         return none(f"{sym} exit plan refused: {_last(err, out)}")
-    rc, out, err = _run("trader-budget/size.py", "--write", "--json")
+    # a limit at the plan's entry caps the fill, so a slow tap cannot raise the loss at the stop
+    rc, out, err = _run("trader-budget/size.py", "--limit", "--write", "--json")
     if rc != 0:
         return none(f"{sym} sizing refused: {((_json(out) or {}).get('sizing') or {}).get('refusal') or _last(err, out)}")
     rc, out, err = _run("trader-risk/check.py", "--json")
@@ -297,7 +319,7 @@ def propose(notify_none: bool = True) -> str:
         res = (_json(out) or {}).get("results") or [{}]
         return none(f"{sym} risk check BLOCK: {'; '.join(res[0].get('reasons', [])) or _last(err, out)}")
     t = _show(1)
-    if not t or not t.get("ready") or not t.get("bracket"):
+    if not t or not t.get("ready") or not t.get("bracket") or t["tool_input"].get("type") != "limit":
         return none(f"{sym} ticket not ready: {(t or {}).get('status', 'ticket.py failed')}")
     with _state() as d:
         tid = f"T:{_now():%Y%m%d}-{len(_today_tickets(d)) + 1}"
@@ -311,15 +333,30 @@ def propose(notify_none: bool = True) -> str:
 
 
 def flatten() -> str:
-    """Exits only reduce risk, so no tap is needed: cancel every open order, close every position."""
-    alpaca("DELETE", "/v2/orders").raise_for_status()
-    r = alpaca("DELETE", "/v2/positions")
+    """Exits only reduce risk, so no tap is needed: cancel every open order, close every position.
+    Alpaca answers 207 with a status per symbol; a failed close is reported, and anything still
+    held after the closes had time to fill raises an ALERT in Telegram."""
+    r = alpaca("DELETE", "/v2/positions", params={"cancel_orders": "true"})
     r.raise_for_status()
-    closed = [c.get("symbol", "?") for c in (r.json() or [])]
+    results = r.json() or []
+    closed = [c.get("symbol", "?") for c in results if c.get("status") == 200]
+    failed = [f"{c.get('symbol', '?')} ({c.get('status')}: {(c.get('body') or {}).get('message', '')})"
+              for c in results if c.get("status") != 200]
+    left = []
+    for _ in range(10):  # market sells usually fill in seconds
+        left = _get("/v2/positions")
+        if not left:
+            break
+        time.sleep(3)
     a = _get("/v2/account")
     pnl = float(a["equity"]) - float(a["last_equity"])
     text = (f"End of day {_now():%Y-%m-%d} (paper): P&L today ${pnl:+,.2f}, equity ${float(a['equity']):,.2f}. "
-            f"Closed: {', '.join(closed) if closed else 'nothing was open'}.")
+            f"Closed: {', '.join(closed) if closed else 'nothing'}.")
+    if failed:
+        text += f" NOT closed: {'; '.join(failed)}."
+    if left:
+        text += (" ALERT: still open after flatten, with no stop overnight: "
+                 + ", ".join(f"{p.get('symbol')} {p.get('qty')}" for p in left) + ". Close it by hand.")
     tg_send(text)
     return text
 
@@ -337,13 +374,23 @@ def status() -> dict:
             "tickets_today": tickets}
 
 
+def in_window(job: str, now: datetime) -> bool:
+    """True within WINDOW_MIN minutes of one of the job's New York slots."""
+    mins = now.hour * 60 + now.minute
+    return any(abs(mins - int(s[:2]) * 60 - int(s[3:])) <= WINDOW_MIN for s in SLOTS[job])
+
+
 def main(argv: list[str]) -> int:
     jobs = {"morning": morning, "propose": propose, "flatten": flatten}
     if len(argv) != 2 or argv[1] not in jobs:
         print("usage: python trader_job.py morning|propose|flatten")
         return 2
+    now = _now()
+    if not in_window(argv[1], now):
+        print(f"{now:%Y-%m-%d %H:%M} ET: outside the {argv[1]} window {'/'.join(SLOTS[argv[1]])}, skipping.")
+        return 0
     if not trading_day():
-        print(f"{_now():%Y-%m-%d %H:%M} ET: no trading session today, skipping {argv[1]}.")
+        print(f"{now:%Y-%m-%d %H:%M} ET: no trading session today, skipping {argv[1]}.")
         return 0
     print(f"{_now():%Y-%m-%d %H:%M} ET {argv[1]}: {jobs[argv[1]]()}")
     return 0

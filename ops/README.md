@@ -47,16 +47,22 @@ A $50 day-trading loop on an Alpaca **paper** account. `trader_job.py` runs the 
 
 ### Schedule
 
-`ops/crontab` is the source of truth. The controller installs it on the VPS host. All times are America/New_York, Monday to Friday:
+`ops/crontab` is the source of truth. The controller installs it on the VPS host. The jobs run Monday to Friday at these America/New_York times:
 
-| Time | Job | Does |
-|---|---|---|
-| 08:45 | `morning` | Scans the candidate list, reads new headlines and Pelosi PTRs, reads the account. Sends one plain message. |
-| 10:00 | `propose` | Opening-range breakout scan, then entry, exit plan, sizing and risk check. A passed ticket goes to Telegram with Approve/Reject buttons. |
-| 10:30 | `propose` | The same. If nothing passes, it sends one line: "No trade today: <reason>". |
-| 15:55 | `flatten` | Cancels all open orders. Closes all positions. Sends the day's P&L and what closed. |
+| Time (ET) | Cron (UTC, EDT and EST) | Job | Does |
+|---|---|---|---|
+| 08:45 | 12:45, 13:45 | `morning` | Scans the candidate list, reads new headlines and Pelosi PTRs, reads the account. Sends one plain message. |
+| 10:00 | 14:00, 15:00 | `propose` | Opening-range breakout scan, then entry, exit plan, sizing and risk check. A passed ticket goes to Telegram with Approve/Reject buttons. |
+| 10:30 | 14:30, 15:30 | `propose` | The same. If nothing passes, it sends one line: "No trade today: <reason>". |
+| 15:55 | 19:55, 20:55 | `flatten` | Cancels all open orders. Closes all positions. Sends the day's P&L, what closed, and what did NOT close. |
 
-Each job first asks Alpaca's calendar for a session. On a market holiday it prints one line and exits 0. Output goes to `/var/log/ops-trader.log`.
+Ubuntu's cron ignores `CRON_TZ`, so the crontab lists each job at both UTC times. `trader_job.py` reads the New York clock. If the time is more than 10 minutes from the job's slot, it prints one line and exits 0. So each job runs once a day, in summer and in winter.
+
+Then each job asks Alpaca's calendar for a session. On a market holiday it prints one line and exits 0. On an early-close day (close is not 16:00), `propose` sends no ticket: the bracket's day legs would end before the 15:55 flatten. Output goes to `/var/log/ops-trader.log`.
+
+`propose` sizes a **limit** order at the plan's entry, so a slow tap cannot fill higher and raise the loss at the stop. It skips a breakout whose trigger bar closed more than 10 minutes ago.
+
+If a close fails, or a position is still open after the flatten, the Telegram line says `NOT closed` or `ALERT`. Close that position by hand on the paper dashboard.
 
 ### Three gates before an order
 
