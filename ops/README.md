@@ -59,7 +59,7 @@ A $50 day-trading loop on an Alpaca **paper** account. `trader_job.py` runs the 
 
 Ubuntu's cron ignores `CRON_TZ`, so the crontab lists each job at both UTC times. `trader_job.py` reads the New York clock. If the time is more than 10 minutes from the job's slot, it prints one line and exits 0. So each job runs once a day, in summer and in winter.
 
-Then each job asks Alpaca's calendar for a session. On a market holiday it prints one line and exits 0. On an early-close day (close is not 16:00), `propose` sends no ticket: the bracket's day legs would end before the 15:55 flatten. Output goes to `/var/log/ops-trader.log`.
+Then `morning` and `propose` ask Alpaca's calendar for a session. On a market holiday each prints one line and exits 0. `flatten` does not ask, because closing positions on a holiday is harmless. On an early-close day (close is not 16:00), `propose` sends no ticket: the bracket's day legs would end before the 15:55 flatten. Output goes to `/var/log/ops-trader.log`.
 
 `propose` sizes a **limit** order at the plan's entry, so a slow tap cannot fill higher and raise the loss at the stop. It skips a breakout whose trigger bar closed more than 10 minutes ago.
 
@@ -72,6 +72,15 @@ If a close fails, or a position is still open after the flatten, the Telegram li
 3. **Paper URL.** `place_ticket` refuses unless the `ALPACA_BASE_URL` host is exactly `paper-api.alpaca.markets`. There is no live switch in code.
 
 A ticket expires **10 minutes** after it is sent. An Approve after that is refused and reported in the chat. A second tap on the same ticket is refused.
+
+### Optional: separate ops bot
+
+Today the ops server and the CEO share one Telegram bot. The CEO process holds a token that could, in principle, read pending buttons. A dedicated bot for the ops server removes this risk. The CEO then does not need to forward `a|` and `r|` presses.
+
+1. Create a new bot with BotFather. Copy its token.
+2. Set that token as `TELEGRAM_BOT_TOKEN` for the ops server only. Keep `TELEGRAM_CHAT_ID` the same.
+3. Register the webhook: call `setWebhook` with `url` set to `https://<ops-host>/tg` and `secret_token` set to the value of `TG_WEBHOOK_SECRET`.
+4. Remove the `a|` and `r|` forwarding from the CEO. Send one test ticket and tap Reject.
 
 ### Why the auto-flatten at 15:55
 

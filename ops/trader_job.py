@@ -117,7 +117,9 @@ def buttons(key: str, rec: dict) -> dict | None:
 def nonce_ok(rec: dict | None, verb: str, nonce: str) -> bool:
     """True only when the tap's nonce equals the one stored for that verb."""
     want = (rec or {}).get(f"nonce_{verb}")
-    return bool(want) and secrets.compare_digest(want, nonce)
+    # compare_digest raises on non-ASCII str, so reject anything else first
+    ok = all(isinstance(x, str) and x.isascii() for x in (want, nonce))
+    return ok and bool(want) and secrets.compare_digest(want, nonce)
 
 
 def tg_send(text: str, markup: dict | None = None) -> bool:

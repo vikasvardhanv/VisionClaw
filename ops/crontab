@@ -1,7 +1,8 @@
 # Paper-trading loop for the ops-mcp container. Installed on the VPS host by the controller.
 # Times are UTC: Ubuntu's cron ignores CRON_TZ. Each job is listed for EDT and for EST;
 # trader_job.py runs only within 10 minutes of its New York slot and skips the other one.
-# It then asks Alpaca's calendar for a session and exits 0 on a holiday.
+# morning and propose then ask Alpaca's calendar for a session and exit 0 on a holiday.
+# flatten skips that check: closing positions on a holiday is harmless.
 # morning 08:45 ET
 45 12 * * 1-5 docker exec ops-mcp python trader_job.py morning >> /var/log/ops-trader.log 2>&1
 45 13 * * 1-5 docker exec ops-mcp python trader_job.py morning >> /var/log/ops-trader.log 2>&1

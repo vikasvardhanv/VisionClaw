@@ -183,10 +183,14 @@ async def telegram_webhook(request: Request):
     if request.headers.get("x-telegram-bot-api-secret-token") != os.environ["TG_WEBHOOK_SECRET"]:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     ok = JSONResponse({"ok": True})
-    cb = (await request.json()).get("callback_query")
-    if not cb or str(cb["message"]["chat"]["id"]) != os.environ["TELEGRAM_CHAT_ID"]:
+    try:
+        cb = (await request.json())["callback_query"]
+        chat, data = str(cb["message"]["chat"]["id"]), cb["data"]
+    except (ValueError, KeyError, TypeError):  # malformed update: ignore it
         return ok
-    parts = (cb.get("data") or "").split("|")
+    if chat != os.environ["TELEGRAM_CHAT_ID"] or not isinstance(data, str):
+        return ok
+    parts = data.split("|")
     if len(parts) != 3 or parts[0] not in ("a", "r"):
         return ok
     verb, key, nonce = parts

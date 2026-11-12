@@ -113,6 +113,24 @@ def test_tg_chairman_tap_places(fake):
     assert [r.url.path for r in fake[0]] == ["/v2/orders"] and record()["status"] == "placed"
 
 
+def test_tg_non_ascii_nonce_changes_nothing(fake):
+    ticket()
+    assert press(1, data=f"a|{TID}|aaaaaaaaaaaé").status_code == 200
+    assert fake[0] == [] and record()["status"] == "pending"
+    assert trader_job.nonce_ok({"nonce_a": "é"}, "a", "é") is False
+    assert trader_job.nonce_ok({"nonce_a": None}, "a", "x") is False
+    assert trader_job.nonce_ok({"nonce_a": "x"}, "a", 5) is False
+
+
+def test_tg_non_str_data_changes_nothing(fake):
+    ticket()
+    assert press(1, data=7).status_code == 200
+    r = TestClient(ops_server.app()).post(
+        "/tg", headers={"x-telegram-bot-api-secret-token": "s"}, json={"callback_query": {}})
+    assert r.status_code == 200
+    assert fake[0] == [] and record()["status"] == "pending"
+
+
 def use(monkeypatch, routes):
     """Fake Alpaca from {(method, path): (status, json)}; returns the request list."""
     seen = []
