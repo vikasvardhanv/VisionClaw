@@ -16,6 +16,7 @@ OPS_STATE (approvals file, default ./approvals.json), PORT (default 8790).
 import json, os, re, time
 from pathlib import Path
 
+import anyio
 import httpx
 from mcp.server.fastmcp import FastMCP
 from starlette.requests import Request
@@ -23,6 +24,8 @@ from starlette.responses import JSONResponse
 
 import logging
 logging.getLogger("httpx").setLevel(logging.WARNING)  # its INFO line prints the Telegram bot token in the URL
+
+import trader_job
 
 GH = "https://api.github.com"
 STATE = Path(os.environ.get("OPS_STATE", "approvals.json"))
@@ -148,6 +151,29 @@ def check_url(url: str, expect: str = "") -> dict:
             "found": (expect in r.text) if expect else None}
 
 
+@mcp.tool()
+def trading_status() -> dict:
+    """Paper account equity and cash, open positions, open orders and today's trade
+    tickets with their status. Read only. An order is placed only when the chairman
+    taps Approve on the Telegram ticket; no tool can place, approve or cancel one."""
+    return trader_job.status()
+
+
+@mcp.tool()
+async def trading_digest() -> str:
+    """Runs the morning digest now (scan, headlines, Pelosi PTRs, account), sends it to
+    Telegram and returns the text. Places nothing: orders need the chairman's Telegram tap."""
+    return await anyio.to_thread.run_sync(trader_job.morning)
+
+
+@mcp.tool()
+async def trading_propose() -> str:
+    """Runs one trade proposal now (ORB scan, entry, exit plan, sizing, risk check) and
+    returns what happened. A ticket that passes goes to Telegram; it is placed on the
+    paper account only if the chairman taps Approve within 10 minutes."""
+    return await anyio.to_thread.run_sync(lambda: trader_job.propose(notify_none=False))
+
+
 @mcp.custom_route("/approve", methods=["POST"])
 async def approve(request: Request):
     """Chairman only: {"repo","pr","decision":"approve"|"reject"} with CHAIRMAN_TOKEN."""
@@ -173,6 +199,11 @@ async def telegram_webhook(request: Request):
     if not cb or str(cb["message"]["chat"]["id"]) != os.environ["TELEGRAM_CHAT_ID"]:
         return JSONResponse({"ok": True})
     verb, key = cb["data"].split("|", 1)
+    if key.startswith("T:"):  # trade ticket: Approve is the only path to an order
+        fn = trader_job.place_ticket if verb == "a" else trader_job.reject_ticket
+        out = await anyio.to_thread.run_sync(fn, key)
+        await anyio.to_thread.run_sync(trader_job.tg_send, out)
+        return JSONResponse({"ok": True})
     d = _load()
     if key in d and d[key]["status"] == "pending":
         d[key]["status"] = "approved" if verb == "a" else "rejected"

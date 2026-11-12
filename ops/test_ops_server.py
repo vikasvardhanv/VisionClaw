@@ -19,3 +19,4 @@ def test_mcp_plain_json_rpc():
         assert "https only" in r.json()["result"]["content"][0]["text"]
         names = [t["name"] for t in rpc(c, "tools/list").json()["result"]["tools"]]
         assert "merge_pr" in names
+        assert {"trading_status", "trading_digest", "trading_propose"} <= set(names)
