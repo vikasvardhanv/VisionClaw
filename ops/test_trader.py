@@ -178,6 +178,22 @@ def test_flatten_touches_only_the_bots_ticket(fake, monkeypatch):  # I1
     assert "Closed F 3" in out and "ALERT" not in out and "AAPL" not in out
 
 
+def test_flatten_twice_closes_once(fake, monkeypatch):  # I1
+    placed_f(monkeypatch)
+    seen = use(monkeypatch, flat_routes())
+    monkeypatch.setattr(trader_job.time, "sleep", lambda s: None)
+    assert "Closed F 3" in trader_job.flatten() and record()["status"] == "flattened"
+    n = len(seen)
+    assert trader_job.flatten() == "Flatten: no bot trades today." and len(seen) == n
+
+
+def test_failed_close_stays_placed(fake, monkeypatch):  # I1
+    placed_f(monkeypatch)
+    use(monkeypatch, flat_routes(close=(403, {"message": "no"})))
+    monkeypatch.setattr(trader_job.time, "sleep", lambda s: None)
+    assert "NOT closed F" in trader_job.flatten() and record()["status"] == "placed"
+
+
 def test_flatten_with_no_placed_tickets_deletes_nothing(fake, monkeypatch):  # I1
     at(monkeypatch, 15, 55, (2026, 11, 12))
     ticket(status="pending")

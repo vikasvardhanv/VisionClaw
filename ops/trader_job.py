@@ -415,7 +415,12 @@ def _flatten() -> str:
         text = "Flatten: no bot trades today."
         tg_send(text)
         return text
-    lines = [_flatten_ticket(tid, sym) for tid, sym in placed.items()]
+    lines = []
+    for tid, sym in placed.items():
+        lines.append(_flatten_ticket(tid, sym))
+        if lines[-1].startswith("Closed"):  # a failed close stays "placed" so a re-run retries it
+            with _state() as d:
+                d[tid]["status"] = "flattened"
     mine = set(placed.values())
     left = []
     for _ in range(10):  # market sells usually fill in seconds
