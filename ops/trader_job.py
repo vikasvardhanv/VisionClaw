@@ -2,7 +2,7 @@
 
     python trader_job.py morning    # 08:45 ET: scan, news, Pelosi PTRs, account -> one Telegram message
     python trader_job.py propose    # 10:00 and 10:30 ET: ORB -> entry -> exit -> size -> risk -> ticket
-    python trader_job.py flatten    # 15:55 ET: cancel open orders, close positions, end-of-day line
+    python trader_job.py flatten    # 15:55 ET: cancel the bot's open orders, close its positions, end-of-day line
 
 The day-trader-skill scripts (cloned at /opt/dts) do the analysis and never
 place orders. This file only runs them and moves their output around. The one
@@ -355,11 +355,16 @@ def propose(notify_none: bool = True) -> str:
     return f"Ticket {tid} {'sent' if sent else 'NOT sent (Telegram unavailable)'}: {t['plain']}"
 
 
+OPEN_STATES = {"new", "accepted", "held", "partially_filled", "pending_new"}
+
+
 def flatten() -> str:
-    """Exits only reduce risk, so no tap is needed: cancel every open order, close every position.
-    Alpaca answers 207 with a status per symbol; a failed close is reported, and anything still
-    held after the closes had time to fill raises an ALERT in Telegram. Any exception (the
-    DELETE itself, a non-paper URL, the account read) still sends an ALERT."""
+    """Exits only reduce risk, so no tap is needed. It touches only what the bot opened: for each
+    of today's placed tickets it cancels that ticket's open orders and closes that ticket's filled
+    qty (capped at the qty held). The account also holds unrelated positions, so the bulk
+    DELETE endpoints are never called. A failed close is reported, and a bot symbol still held
+    after the closes had time to fill raises an ALERT in Telegram. Any exception (a non-paper URL,
+    an Alpaca error, the account read) still sends an ALERT."""
     try:
         return _flatten()
     except Exception as e:
@@ -368,25 +373,60 @@ def flatten() -> str:
         return text
 
 
+def _alpaca_msg(r: httpx.Response) -> str:
+    try:
+        return r.json().get("message", "")
+    except Exception:
+        return r.text[:80]
+
+
+def _cancel_open(order: dict) -> None:
+    """Cancels the order and each of its legs that is still open. 404/422: already done."""
+    for o in [order, *(order.get("legs") or [])]:
+        if o.get("status") in OPEN_STATES:
+            r = alpaca("DELETE", f"/v2/orders/{o['id']}")
+            if r.status_code not in (404, 422):
+                r.raise_for_status()
+
+
+def _flatten_ticket(tid: str, sym: str) -> str:
+    """One ticket: cancel its open orders, then close its filled qty. Returns the report line."""
+    q = {"client_order_id": tid, "nested": "true"}
+    r = alpaca("GET", "/v2/orders:by_client_order_id", params=q)
+    if r.status_code != 200:
+        return f"NOT closed {sym} ({r.status_code}: {_alpaca_msg(r)})"
+    _cancel_open(r.json())
+    order = _get("/v2/orders:by_client_order_id", params=q)  # fills may land while cancelling
+    filled = float(order.get("filled_qty") or 0)
+    r = alpaca("GET", f"/v2/positions/{sym}")
+    held = 0.0 if r.status_code == 404 else float((r.raise_for_status(), r.json())[1]["qty"])
+    qty = min(filled, held)
+    if qty > 0:
+        r = alpaca("DELETE", f"/v2/positions/{sym}", params={"qty": f"{qty:g}"})
+        if r.status_code >= 300:
+            return f"NOT closed {sym} ({r.status_code}: {_alpaca_msg(r)})"
+    return f"Closed {sym} {qty:g}"
+
+
 def _flatten() -> str:
-    r = alpaca("DELETE", "/v2/positions", params={"cancel_orders": "true"})
-    r.raise_for_status()
-    results = r.json() or []
-    closed = [c.get("symbol", "?") for c in results if c.get("status") == 200]
-    failed = [f"{c.get('symbol', '?')} ({c.get('status')}: {(c.get('body') or {}).get('message', '')})"
-              for c in results if c.get("status") != 200]
+    with _state() as d:
+        placed = {k: v["order"]["symbol"] for k, v in _today_tickets(d).items() if v.get("status") == "placed"}
+    if not placed:
+        text = "Flatten: no bot trades today."
+        tg_send(text)
+        return text
+    lines = [_flatten_ticket(tid, sym) for tid, sym in placed.items()]
+    mine = set(placed.values())
     left = []
     for _ in range(10):  # market sells usually fill in seconds
-        left = _get("/v2/positions")
+        left = [p for p in _get("/v2/positions") if p.get("symbol") in mine]
         if not left:
             break
         time.sleep(3)
     a = _get("/v2/account")
     pnl = float(a["equity"]) - float(a["last_equity"])
-    text = (f"End of day {_now():%Y-%m-%d} (paper): P&L today ${pnl:+,.2f}, equity ${float(a['equity']):,.2f}. "
-            f"Closed: {', '.join(closed) if closed else 'nothing'}.")
-    if failed:
-        text += f" NOT closed: {'; '.join(failed)}."
+    text = (f"End of day {_now():%Y-%m-%d} (paper): account P&L today ${pnl:+,.2f} "
+            f"(includes non-bot positions), equity ${float(a['equity']):,.2f}. " + "; ".join(lines) + ".")
     if left:
         text += (" ALERT: still open after flatten, with no stop overnight: "
                  + ", ".join(f"{p.get('symbol')} {p.get('qty')}" for p in left) + ". Close it by hand.")
@@ -395,16 +435,21 @@ def _flatten() -> str:
 
 
 def status() -> dict:
+    """The bot's own tickets come first. Positions and orders are the whole account,
+    which also holds non-bot positions."""
     a = _get("/v2/account")
     with _state() as d:
         tickets = {k: {"status": v["status"], "summary": v["summary"], "at": v["at"]}
                    for k, v in _today_tickets(d).items()}
-    return {"account": {k: a.get(k) for k in ("equity", "cash", "last_equity")},
-            "positions": [{k: p.get(k) for k in ("symbol", "qty", "avg_entry_price", "unrealized_pl")}
-                          for p in _get("/v2/positions")],
-            "open_orders": [{k: o.get(k) for k in ("symbol", "side", "qty", "type", "order_class", "status")}
-                            for o in _get("/v2/orders", params={"status": "open"})],
-            "tickets_today": tickets}
+    tickets = dict(sorted(tickets.items(), key=lambda kv: kv[1]["status"] != "placed"))
+    return {"bot_tickets_today": tickets,
+            "account": {k: a.get(k) for k in ("equity", "cash", "last_equity")},
+            "account positions (includes non-bot positions)": [
+                {k: p.get(k) for k in ("symbol", "qty", "avg_entry_price", "unrealized_pl")}
+                for p in _get("/v2/positions")],
+            "account open orders (includes non-bot orders)": [
+                {k: o.get(k) for k in ("symbol", "side", "qty", "type", "order_class", "status")}
+                for o in _get("/v2/orders", params={"status": "open"})]}
 
 
 def in_window(job: str, now: datetime) -> bool:

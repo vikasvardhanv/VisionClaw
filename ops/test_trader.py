@@ -150,18 +150,58 @@ def at(monkeypatch, hh, mm, day=(2026, 11, 16)):  # a Monday, EST
 CAL = {("GET", "/v2/calendar"): (200, [{"date": "2026-11-16", "open": "09:30", "close": "16:00"}])}
 
 
-def test_flatten_reports_a_failed_close(fake, monkeypatch):  # I1
-    seen = use(monkeypatch, {
-        ("DELETE", "/v2/positions"): (207, [
-            {"symbol": "F", "status": 200, "body": {}},
-            {"symbol": "AAL", "status": 403, "body": {"message": "insufficient qty available for order"}}]),
-        ("GET", "/v2/positions"): (200, [{"symbol": "AAL", "qty": "3"}]),
-        ("GET", "/v2/account"): (200, {"equity": "100000", "last_equity": "100001"})})
+def placed_f(monkeypatch, qty="3"):
+    at(monkeypatch, 15, 55, (2026, 11, 12))
+    ticket(status="placed")
+    with trader_job._state() as d:
+        d[TID]["order"] = {**ORDER, "qty": qty}
+
+
+def flat_routes(filled="3", held="3", close=(200, {}), extra=None):
+    parent = {"id": "p1", "status": "filled", "filled_qty": filled, "legs": [
+        {"id": "tp1", "status": "new"}, {"id": "sl1", "status": "held"}, {"id": "x", "status": "canceled"}]}
+    return {("GET", "/v2/orders:by_client_order_id"): (200, parent),
+            ("DELETE", "/v2/orders/tp1"): (204, {}), ("DELETE", "/v2/orders/sl1"): (204, {}),
+            ("GET", "/v2/positions/F"): (200, {"symbol": "F", "qty": held}) if held else (404, {}),
+            ("DELETE", "/v2/positions/F"): close,
+            ("GET", "/v2/positions"): (200, [{"symbol": "AAPL", "qty": "10"}]),
+            ("GET", "/v2/account"): (200, {"equity": "100000", "last_equity": "100001"}), **(extra or {})}
+
+
+def test_flatten_touches_only_the_bots_ticket(fake, monkeypatch):  # I1
+    placed_f(monkeypatch)
+    seen = use(monkeypatch, flat_routes())
     monkeypatch.setattr(trader_job.time, "sleep", lambda s: None)
     out = trader_job.flatten()
-    assert seen[0].url.params["cancel_orders"] == "true"
-    assert "Closed: F." in out and "NOT closed: AAL (403: insufficient qty" in out
-    assert "ALERT" in out and "AAL 3" in out
+    deletes = [(r.url.path, dict(r.url.params)) for r in seen if r.method == "DELETE"]
+    assert deletes == [("/v2/orders/tp1", {}), ("/v2/orders/sl1", {}), ("/v2/positions/F", {"qty": "3"})]
+    assert "Closed F 3" in out and "ALERT" not in out and "AAPL" not in out
+
+
+def test_flatten_with_no_placed_tickets_deletes_nothing(fake, monkeypatch):  # I1
+    at(monkeypatch, 15, 55, (2026, 11, 12))
+    ticket(status="pending")
+    seen = use(monkeypatch, {})
+    assert trader_job.flatten() == "Flatten: no bot trades today."
+    assert seen == []
+
+
+def test_flatten_caps_qty_at_the_qty_held(fake, monkeypatch):  # I1
+    placed_f(monkeypatch)
+    seen = use(monkeypatch, flat_routes(filled="5", held="2"))
+    monkeypatch.setattr(trader_job.time, "sleep", lambda s: None)
+    assert "Closed F 2" in trader_job.flatten()
+    assert [dict(r.url.params) for r in seen if r.url.path == "/v2/positions/F" and r.method == "DELETE"] == [{"qty": "2"}]
+
+
+def test_flatten_reports_a_failed_close_and_alerts(fake, monkeypatch):  # I1
+    placed_f(monkeypatch)
+    held_f = flat_routes(close=(403, {"message": "insufficient qty available for order"}),
+                         extra={("GET", "/v2/positions"): (200, [{"symbol": "F", "qty": "3"}])})
+    use(monkeypatch, held_f)
+    monkeypatch.setattr(trader_job.time, "sleep", lambda s: None)
+    out = trader_job.flatten()
+    assert "NOT closed F (403: insufficient qty" in out and "ALERT" in out and "F 3" in out
 
 
 def test_propose_refuses_an_early_close(fake, monkeypatch):  # I2
@@ -302,11 +342,13 @@ def test_pr_request_refuses_callback_over_64_bytes(fake, monkeypatch):
 
 
 def test_trading_status_shows_no_nonce(fake, monkeypatch):
+    at(monkeypatch, 10, 0, (2026, 11, 12))
     ticket()
     use(monkeypatch, {("GET", "/v2/account"): (200, {"equity": "50", "cash": "50", "last_equity": "50"}),
                       ("GET", "/v2/positions"): (200, []), ("GET", "/v2/orders"): (200, [])})
     out = json.dumps(ops_server.trading_status())
     assert TID in out and NA not in out and NR not in out and "nonce" not in out
+    assert "includes non-bot positions" in out and out.index("bot_tickets_today") < out.index("account positions")
 
 
 def test_tg_ticket_exception_tells_the_chairman(fake, monkeypatch):  # I3
@@ -319,7 +361,8 @@ def test_tg_ticket_exception_tells_the_chairman(fake, monkeypatch):  # I3
 
 
 def test_flatten_failure_alerts(fake, monkeypatch):  # I4
-    use(monkeypatch, {("DELETE", "/v2/positions"): (500, {"message": "down"})})
+    placed_f(monkeypatch)
+    use(monkeypatch, flat_routes(extra={("GET", "/v2/positions/F"): (500, {"message": "down"})}))
     said = []
     monkeypatch.setattr(trader_job, "tg_send", lambda text, markup=None: said.append(text) or True)
     out = trader_job.flatten()
