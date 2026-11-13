@@ -10,7 +10,7 @@ Single door for agents to reach GitHub, the VPS and Thor. Fixed tools, no raw sh
 | `service_health` | Probes the HTTP health endpoints named in `OPS_HEALTH_URLS`. |
 | `coolify_status` | Lists Coolify applications on the VPS with their status. |
 | `check_url` | HTTPS fetch: status, title, expected text. Static HTML only. |
-| `trading_status` | Paper account equity and cash, positions, open orders, today's trade tickets. Read only. |
+| `trading_status` | Today's bot tickets first, then the whole paper account: equity and cash, positions, open orders (labelled as including non-bot items). Read only. |
 | `trading_digest` | Runs the morning digest now, sends it to Telegram, returns the text. |
 | `trading_propose` | Runs one trade proposal now and returns what happened. Places nothing. |
 
@@ -55,7 +55,7 @@ A $50 day-trading loop on an Alpaca **paper** account. `trader_job.py` runs the 
 | 08:45 | 12:45, 13:45 | `morning` | Scans the candidate list, reads new headlines and Pelosi PTRs, reads the account. Sends one plain message. |
 | 10:00 | 14:00, 15:00 | `propose` | Opening-range breakout scan, then entry, exit plan, sizing and risk check. A passed ticket goes to Telegram with Approve/Reject buttons. |
 | 10:30 | 14:30, 15:30 | `propose` | The same. If nothing passes, it sends one line: "No trade today: <reason>". |
-| 15:55 | 19:55, 20:55 | `flatten` | Cancels all open orders. Closes all positions. Sends the day's P&L, what closed, and what did NOT close. |
+| 15:55 | 19:55, 20:55 | `flatten` | Closes only the bot's own positions and orders: for each ticket placed today it cancels that ticket's open orders and closes that ticket's filled qty. Never touches other positions or orders in the account. Sends the day's P&L, what closed, and what did NOT close. |
 
 Ubuntu's cron ignores `CRON_TZ`, so the crontab lists each job at both UTC times. `trader_job.py` reads the New York clock. If the time is more than 10 minutes from the job's slot, it prints one line and exits 0. So each job runs once a day, in summer and in winter.
 
@@ -84,7 +84,7 @@ Today the ops server and the CEO share one Telegram bot. The CEO process holds a
 
 ### Why the auto-flatten at 15:55
 
-The plan is a day trade: no overnight hold. The bracket's stop-loss and take-profit legs are day orders and end at the close. After the close, a position has no stop. The 15:55 job closes everything first. Exits only reduce risk, so this job needs no tap.
+The plan is a day trade: no overnight hold. The bracket's stop-loss and take-profit legs are day orders and end at the close. After the close, a position has no stop. The 15:55 job closes the bot's own positions first. It never uses the bulk close endpoints, because the account also holds positions that the bot did not open. Exits only reduce risk, so this job needs no tap.
 
 ### Env
 
