@@ -13,6 +13,7 @@ Single door for agents to reach GitHub, the VPS and Thor. Fixed tools, no raw sh
 | `trading_status` | Today's bot tickets first, then the whole paper account: equity and cash, positions, open orders (labelled as including non-bot items). Read only. |
 | `trading_digest` | Runs the morning digest now, sends it to Telegram, returns the text. |
 | `trading_propose` | Runs one trade proposal now and returns what happened. Places nothing. |
+| `ask_ceo` | Sends an instruction to the ProjectNexus CEO as the chairman and returns the CEO's reply. The CEO mirrors the exchange to the chairman's Telegram. |
 
 ## Approval flow
 
@@ -123,6 +124,21 @@ Each Approve/Reject keyboard carries a fresh random nonce per verb (`a|<key>|<no
 | (public URL) | `OPS_MCP_URL` | `https://ops.76-13-124-154.sslip.io/mcp` |
 | `TELEGRAM_BOT_TOKEN` | `TELEGRAM_BOT_TOKEN` | The shared bot. |
 | `TELEGRAM_CHAT_ID` | `TELEGRAM_CHAT_ID` | The chairman's chat. The CEO ignores every other chat. |
+| `CEO_INBOX_TOKEN` | `CEO_INBOX_TOKEN` | Identical. The CEO inbox stays off when it is unset. |
+| `CEO_INBOX_URL` | (compose port) | `http://100.120.229.126:8791/chairman`, the tailnet IP only. |
+
+## Chairman mode (VisionClaw)
+
+When the chairman turns on **Chairman mode** in the VisionClaw app, voice requests go to a separate Claude agent on the gateway. That agent has one MCP server: this one. It uses `ask_ceo` for business work and the other tools for checks and PRs.
+
+```
+iPhone (switch on) -> gateway /livekit-token: metadata chairman=true, only for CHAIRMAN_USER_ID
+voice worker -> gateway /v1/chat/completions with X-Chairman: 1
+gateway -> chairman agent (Managed Agents), ops bearer in the chairman's vault only
+chairman agent -> ops MCP -> ask_ceo -> CEO POST /chairman -> Agent Zero on Thor
+```
+
+Gateway env (Fly): `CHAIRMAN_USER_ID` (the chairman's gateway userId), `OPS_MCP_URL` (`https://ops.76-13-124-154.sslip.io/mcp`), `OPS_AGENT_TOKEN`. If any of the three is missing, the switch does nothing. With the switch off, nothing changes.
 
 Trading env on the ops server: `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `ALPACA_BASE_URL` (`https://paper-api.alpaca.markets`), and optionally `TRADER_SYMBOLS` (see Trading > Env).
 

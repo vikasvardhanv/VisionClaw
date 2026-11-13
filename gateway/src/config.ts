@@ -30,6 +30,14 @@ export interface GatewayConfig {
   autoApproveDomains: string[];
   /** Approve every new account (study-window convenience; the kill switch is registrationOpen). */
   autoApproveAll: boolean;
+  /**
+   * Chairman mode: the one userId whose app switch may route turns to the
+   * chairman agent (ops MCP: CEO, GitHub, VPS, Thor). Any other user's switch is
+   * ignored server-side. Off unless all three are set.
+   */
+  chairmanUserId?: string;
+  opsMcpUrl?: string;
+  opsAgentToken?: string;
 }
 
 function parseTokens(raw: string | undefined): Map<string, string> {
@@ -63,7 +71,16 @@ export const config: GatewayConfig = {
     .map((d) => d.trim().toLowerCase())
     .filter(Boolean),
   autoApproveAll: process.env.AUTO_APPROVE_ALL === "true",
+  chairmanUserId: process.env.CHAIRMAN_USER_ID || undefined,
+  opsMcpUrl: process.env.OPS_MCP_URL || undefined,
+  opsAgentToken: process.env.OPS_AGENT_TOKEN || undefined,
 };
+
+/** True only for the configured chairman, and only when the ops server is wired. */
+export function isChairman(userId: string): boolean {
+  return !!(config.chairmanUserId && config.opsMcpUrl && config.opsAgentToken) &&
+    userId === config.chairmanUserId;
+}
 
 if (config.tokens.size === 0) {
   console.warn(

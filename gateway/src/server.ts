@@ -3,9 +3,9 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import express from "express";
 import { WebSocketServer, type WebSocket } from "ws";
-import { config } from "./config.js";
+import { config, isChairman } from "./config.js";
 import { initStore, saveStore, userResources } from "./store.js";
-import { ensureUser } from "./provision.js";
+import { chairmanKey, ensureUser } from "./provision.js";
 import { runTurn, runTurnStreaming, queueContext, drainContext, type TurnStats } from "./turn.js";
 import { registerSocket, notifyUser, queuePending, drainPending } from "./notify.js";
 import { appendTrace, readTrace } from "./trace.js";
@@ -149,13 +149,17 @@ app.post("/v1/chat/completions", async (req, res) => {
     res.status(400).json({ error: { message: "no user message found" } });
     return;
   }
+  // Chairman mode: the app's switch rides as X-Chairman, but only the configured
+  // chairman ever gets the ops agent -- for anyone else the header is ignored.
+  const chairman = req.header("x-chairman") === "1" && isChairman(userId);
+  const sessionOwner = chairman ? chairmanKey(userId) : userId;
 
   // ---- streaming path (OpenAI-style SSE chunks) ----
   if (req.body?.stream === true) {
     let sessionId: string;
     try {
-      ({ sessionId } = await ensureUser(userId));
-      await markSessionUsed(userId);
+      ({ sessionId } = await ensureUser(userId, chairman));
+      await markSessionUsed(sessionOwner);
     } catch (err) {
       console.error("[chat] provisioning failed:", err);
       res.status(502).json({ error: { message: "agent backend error" } });
@@ -230,8 +234,8 @@ app.post("/v1/chat/completions", async (req, res) => {
   }
 
   try {
-    const { sessionId } = await ensureUser(userId);
-    await markSessionUsed(userId);
+    const { sessionId } = await ensureUser(userId, chairman);
+    await markSessionUsed(sessionOwner);
     // The agent worker (service token) blocks on its own tool timeout and
     // relays the finished answer into the voice session -- handing IT the
     // spawn-mode acknowledgement would make the assistant read a status
@@ -449,10 +453,13 @@ app.post("/livekit-token", async (req, res) => {
   // unknown, never as a confident wrong condition.
   const rawSource = req.body?.source;
   const source = rawSource === "glasses" || rawSource === "phone" ? rawSource : undefined;
+  // Chairman mode is decided here, server-side: the app's switch counts only
+  // for the configured chairman. The worker echoes it back as X-Chairman.
+  const chairman = req.body?.chairman === true && isChairman(userId);
   const at = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
     identity: userId,
     ttl: "15m",
-    metadata: JSON.stringify(source ? { engine, source } : { engine }),
+    metadata: JSON.stringify({ engine, ...(source && { source }), ...(chairman && { chairman }) }),
   });
   // One room per call, not per user: agent dispatch fires on room creation,
   // so a redial into a still-draining room from the previous call would get

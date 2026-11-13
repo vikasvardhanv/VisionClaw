@@ -650,6 +650,7 @@ final class LiveKitSession: NSObject, ObservableObject {
     request.httpBody = try JSONSerialization.data(withJSONObject: [
       "engine": SettingsManager.shared.intelligenceEngine.rawValue,
       "source": SettingsManager.shared.captureSource == .glasses ? "glasses" : "phone",
+      "chairman": SettingsManager.shared.chairmanMode,
     ])
 
     let (data, response) = try await URLSession.shared.data(for: request)

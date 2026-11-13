@@ -338,11 +338,19 @@ GATEWAY_DEFERRAL_PREFIX = "[task started]"
 _relay_tasks: set[asyncio.Task] = set()
 
 
+# Users whose room token says chairman mode. The gateway minted that flag only for
+# the configured chairman and re-checks it on every call, so this is a relay.
+_CHAIRMAN_USERS: set[str] = set()
+
+
 def _gateway_headers(user_id: str) -> dict[str, str]:
-    return {
+    h = {
         "Authorization": f"Bearer {os.environ['GATEWAY_SERVICE_TOKEN']}",
         "X-User-Id": user_id,
     }
+    if user_id in _CHAIRMAN_USERS:
+        h["X-Chairman"] = "1"
+    return h
 
 
 def _gateway_url() -> str:
@@ -1082,7 +1090,12 @@ async def entrypoint(ctx: JobContext):
     # they are exactly the glasses-arm failures, which would bias the study.
     declared_source = meta.get("source") or None
     user_id = participant.identity or "demo"
-    logger.info("session start: user=%s engine=%s", user_id, engine)
+    if meta.get("chairman") is True:
+        _CHAIRMAN_USERS.add(user_id)
+    else:
+        _CHAIRMAN_USERS.discard(user_id)
+    logger.info("session start: user=%s engine=%s chairman=%s", user_id, engine,
+                user_id in _CHAIRMAN_USERS)
 
     tracer = Tracer(user_id)
     tracer.emit("session_start", engine=engine, room=ctx.room.name,

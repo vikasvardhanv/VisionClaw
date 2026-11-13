@@ -135,6 +135,15 @@ final class SettingsManager {
     set { defaults.set(newValue, forKey: Self.showCaptionsKey) }
   }
 
+  static let chairmanModeKey = "chairmanMode"
+
+  /// Off by default. Sent with the room ticket; the gateway honours it only for
+  /// the configured chairman account, so flipping it elsewhere changes nothing.
+  var chairmanMode: Bool {
+    get { defaults.bool(forKey: Self.chairmanModeKey) }
+    set { defaults.set(newValue, forKey: Self.chairmanModeKey) }
+  }
+
   /// Cloud by default: the hosted gateway needs nothing installed and keeps
   /// working with the phone away from home, which self-hosting cannot do.
   var agentBackend: AgentBackend {

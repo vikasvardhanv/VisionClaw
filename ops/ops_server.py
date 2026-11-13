@@ -159,6 +159,25 @@ async def trading_propose() -> str:
     return await anyio.to_thread.run_sync(lambda: trader_job.propose(notify_none=False))
 
 
+@mcp.tool()
+async def ask_ceo(instruction: str) -> str:
+    """Hands an instruction to the CEO agent (ProjectNexus) as if the chairman sent it,
+    and returns the CEO's reply. The CEO delegates execution to Agent Zero on Thor and
+    queues long work as missions. The exchange is mirrored to the chairman's Telegram.
+    Merges and trades still need the chairman's Telegram tap."""
+    url, tok = os.environ.get("CEO_INBOX_URL"), os.environ.get("CEO_INBOX_TOKEN")
+    if not (url and tok):
+        return "CEO inbox is not configured on the ops server (CEO_INBOX_URL, CEO_INBOX_TOKEN)."
+    try:
+        async with httpx.AsyncClient(timeout=180) as c:
+            r = await c.post(url, json={"text": instruction}, headers={"Authorization": f"Bearer {tok}"})
+    except httpx.HTTPError as e:  # unreachable is an answer the agent can say, not a crash
+        return f"Could not reach the CEO: {type(e).__name__}."
+    if r.status_code != 200:
+        return f"The CEO inbox returned HTTP {r.status_code}."
+    return r.json().get("reply", "")
+
+
 @mcp.custom_route("/approve", methods=["POST"])
 async def approve(request: Request):
     """Chairman only: {"repo","pr","decision":"approve"|"reject"} with CHAIRMAN_TOKEN."""

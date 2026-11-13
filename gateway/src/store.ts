@@ -11,6 +11,9 @@ export interface SharedResources {
   environmentId?: string;
   agentId?: string;
   agentVersion?: number;
+  /** Chairman-mode agent: ops MCP only. Separate from agentId so no other user sees its tools. */
+  chairmanAgentId?: string;
+  chairmanAgentVersion?: number;
   /** Dynamic OAuth client registrations with remote MCP servers, by app id.
    * Registered once per gateway; re-registered if our callback URL changes. */
   mcpClients?: Record<string, McpClientRegistration>;

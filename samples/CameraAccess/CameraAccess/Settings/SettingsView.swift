@@ -51,6 +51,7 @@ struct SettingsView: View {
   @AppStorage(CaptureSource.defaultsKey) private var captureSourceRaw = CaptureSource.iPhoneCamera.rawValue
   @AppStorage(IntelligenceEngine.defaultsKey) private var intelligenceRaw = IntelligenceEngine.openai.rawValue
   @AppStorage(SettingsManager.showCaptionsKey) private var showCaptions = true
+  @AppStorage(SettingsManager.chairmanModeKey) private var chairmanMode = false
 
   var body: some View {
     NavigationView {
@@ -76,6 +77,12 @@ struct SettingsView: View {
           }
           .pickerStyle(.segmented)
           Toggle("Show captions", isOn: $showCaptions)
+        }
+
+        Section(header: Text("Chairman"), footer: Text(chairmanMode
+          ? "Claude takes your requests and gets them done through the CEO, GitHub and your servers. Merges and trades still wait for your tap in Telegram. Applies to the next call."
+          : "The assistant works as usual. Applies to the next call.")) {
+          Toggle("Chairman mode", isOn: $chairmanMode)
         }
 
         // Cloud gateway is the only backend now.

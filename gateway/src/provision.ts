@@ -15,14 +15,58 @@ Ground rules:
 - For multi-step work, start immediately and keep intermediate narration to a single short sentence.
 - If a task cannot be completed, say what you tried and what is missing, in one sentence.`;
 
+const CHAIRMAN_SYSTEM_PROMPT = `${AGENT_SYSTEM_PROMPT}
+
+Chairman mode: the person speaking is the chairman who owns the company, and you act for them through the ops tools.
+- ask_ceo hands an instruction to the CEO agent, which runs the business and executes through Agent Zero on Thor.
+  Use it for anything addressed to the CEO, and for business work the CEO owns (content, revenue, missions, research).
+- Use the GitHub, Coolify, service health and trading tools directly for checks and for opening PRs.
+- Merges and trades happen only after the chairman taps Approve in Telegram. After request_merge or a trade
+  proposal, say it is waiting for their tap. Never say a merge or trade happened unless a tool result says so.
+- Relay what the CEO said in one or two spoken sentences, not its whole reply.`;
+
+/** An agent config the gateway owns. The chairman profile carries only the ops server. */
+interface Profile {
+  storeKey: "agentId" | "chairmanAgentId";
+  name: string;
+  system: string;
+  servers: () => ReturnType<typeof mcpServers>;
+  tools: () => ReturnType<typeof agentTools>;
+}
+
+const DEFAULT_PROFILE: Profile = {
+  storeKey: "agentId",
+  name: "VisionClaw Action Agent",
+  system: AGENT_SYSTEM_PROMPT,
+  servers: () => mcpServers(),
+  tools: () => agentTools(),
+};
+
+const CHAIRMAN_PROFILE: Profile = {
+  storeKey: "chairmanAgentId",
+  name: "VisionClaw Chairman Agent",
+  system: CHAIRMAN_SYSTEM_PROMPT,
+  servers: () => [{ type: "url" as const, name: "ops", url: config.opsMcpUrl! }],
+  tools: () => [
+    { type: "agent_toolset_20260401" as const },
+    // always_allow is safe here only because the ops server itself refuses merges
+    // and trades without the chairman's Telegram tap.
+    { type: "mcp_toolset" as const, mcp_server_name: "ops",
+      default_config: { permission_policy: { type: "always_allow" as const } } },
+  ],
+};
+
+/** Store key for the chairman's separate vault + session. */
+export const chairmanKey = (userId: string) => `${userId}~chairman`;
+
 // Drift checks cost Anthropic API round-trips before every task; config only
 // changes on deploy, so verify at most once per interval per process.
 const RECONCILE_TTL_MS = 10 * 60 * 1000;
-let sharedVerifiedAt = 0;
+const sharedVerifiedAt = new Map<string, number>();
 const sessionVerifiedAt = new Map<string, number>();
 
 /** Create the shared environment + agent once; IDs persist in the store. */
-export async function ensureShared(): Promise<{ agentId: string; environmentId: string }> {
+export async function ensureShared(p: Profile = DEFAULT_PROFILE): Promise<{ agentId: string; environmentId: string }> {
   const store = await loadStore();
   if (!store.shared.environmentId) {
     const env = await anthropic.beta.environments.create({
@@ -32,44 +76,46 @@ export async function ensureShared(): Promise<{ agentId: string; environmentId: 
     store.shared.environmentId = env.id;
     console.log("[provision] environment created:", env.id);
   }
-  if (!store.shared.agentId) {
+  const version = p.storeKey === "agentId" ? "agentVersion" : "chairmanAgentVersion";
+  const existing = store.shared[p.storeKey];
+  if (!existing) {
     const agent = await anthropic.beta.agents.create({
-      name: "VisionClaw Action Agent",
+      name: p.name,
       model: wantModel(),
-      system: AGENT_SYSTEM_PROMPT,
-      mcp_servers: mcpServers(),
-      tools: agentTools(),
+      system: p.system,
+      mcp_servers: p.servers(),
+      tools: p.tools(),
     });
-    store.shared.agentId = agent.id;
-    store.shared.agentVersion = agent.version;
-    console.log("[provision] agent created:", agent.id, "version", agent.version);
-  } else if (Date.now() - sharedVerifiedAt > RECONCILE_TTL_MS) {
-    sharedVerifiedAt = Date.now();
+    store.shared[p.storeKey] = agent.id;
+    store.shared[version] = agent.version;
+    console.log(`[provision] ${p.name} created:`, agent.id, "version", agent.version);
+  } else if (Date.now() - (sharedVerifiedAt.get(p.storeKey) ?? 0) > RECONCILE_TTL_MS) {
+    sharedVerifiedAt.set(p.storeKey, Date.now());
     // Reconcile: adding an app to the registry must reach an agent that already
     // exists, or its new tools are silently missing. Version-bump only on drift.
-    const agent = await anthropic.beta.agents.retrieve(store.shared.agentId);
+    const agent = await anthropic.beta.agents.retrieve(existing);
     // Compare servers *and* tool config: a changed permission policy is drift
     // just as much as a new app is.
     const appsDrifted =
-      appSignature(agent.mcp_servers ?? [], agent.tools ?? []) !== appSignature(mcpServers(), agentTools());
+      appSignature(agent.mcp_servers ?? [], agent.tools ?? []) !== appSignature(p.servers(), p.tools());
     const modelDrifted = modelSignature(agent.model) !== modelSignature(wantModel());
-    const systemDrifted = (agent.system ?? "") !== AGENT_SYSTEM_PROMPT;
+    const systemDrifted = (agent.system ?? "") !== p.system;
     if (appsDrifted || modelDrifted || systemDrifted) {
-      const updated = await anthropic.beta.agents.update(store.shared.agentId, {
-        mcp_servers: mcpServers(),
-        tools: agentTools(),
+      const updated = await anthropic.beta.agents.update(existing, {
+        mcp_servers: p.servers(),
+        tools: p.tools(),
         model: wantModel(),
-        system: AGENT_SYSTEM_PROMPT,
+        system: p.system,
       });
-      store.shared.agentVersion = updated.version;
+      store.shared[version] = updated.version;
       const what = [appsDrifted && "apps", modelDrifted && "model", systemDrifted && "system"]
         .filter(Boolean)
         .join(" + ");
-      console.log(`[provision] agent ${what} reconciled, version`, updated.version);
+      console.log(`[provision] ${p.name} ${what} reconciled, version`, updated.version);
     }
   }
   await saveStore();
-  return { agentId: store.shared.agentId, environmentId: store.shared.environmentId };
+  return { agentId: store.shared[p.storeKey]!, environmentId: store.shared.environmentId };
 }
 
 /**
@@ -151,14 +197,28 @@ async function sessionUsable(sessionId: string): Promise<boolean> {
  * store are kept but unused; re-mounting is one resources entry away if a
  * memory feature earns its latency.
  */
-export async function ensureUser(userId: string): Promise<UserResources & { sessionId: string; vaultId: string }> {
-  const { agentId, environmentId } = await ensureShared();
+export async function ensureUser(
+  realUserId: string,
+  chairman = false,
+): Promise<UserResources & { sessionId: string; vaultId: string }> {
+  const p = chairman ? CHAIRMAN_PROFILE : DEFAULT_PROFILE;
+  const userId = chairman ? chairmanKey(realUserId) : realUserId;
+  const { agentId, environmentId } = await ensureShared(p);
   const u = await userResources(userId);
 
   if (!u.vaultId) {
     const vault = await anthropic.beta.vaults.create({ display_name: `visionclaw-vault-${userId}` });
     u.vaultId = vault.id;
     console.log(`[provision] vault for ${userId}:`, vault.id);
+    if (chairman) {
+      // The ops bearer lives only in the chairman's vault; Anthropic injects it at
+      // egress, so it never enters the sandbox. ponytail: written once at vault
+      // creation -- rotating OPS_AGENT_TOKEN means deleting this store entry.
+      await anthropic.beta.vaults.credentials.create(vault.id, {
+        display_name: "ops MCP (chairman)",
+        auth: { type: "static_bearer", mcp_server_url: config.opsMcpUrl!, token: config.opsAgentToken! },
+      });
+    }
   }
 
   const verifiedAt = u.sessionId ? (sessionVerifiedAt.get(u.sessionId) ?? 0) : 0;
@@ -180,10 +240,10 @@ export async function ensureUser(userId: string): Promise<UserResources & { sess
     try {
       const live = await anthropic.beta.sessions.retrieve(u.sessionId);
       const have = appSignature(live.agent?.mcp_servers ?? [], live.agent?.tools ?? []);
-      const want = appSignature(mcpServers(), agentTools());
+      const want = appSignature(p.servers(), p.tools());
       if (have !== want && live.status === "idle") {
         await anthropic.beta.sessions.update(u.sessionId, {
-          agent: { mcp_servers: mcpServers(), tools: agentTools() },
+          agent: { mcp_servers: p.servers(), tools: p.tools() },
         });
         console.log(`[provision] session apps reconciled for ${userId}`);
       }
