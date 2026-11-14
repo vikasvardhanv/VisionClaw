@@ -101,7 +101,10 @@ s, b = call("PATCH", f"/applications/{app}/envs/bulk",
             {"data": [{"key": k, "value": os.environ[k]} for k in ("CEO_INBOX_TOKEN", "GITHUB_TOKEN")]})
 print("CEO env:", s)
 if s < 300:
-    print("CEO deploy queued:", call("GET", f"/deploy?uuid={app}&force=false")[0])
+    # Newer Coolify builds answer GET /deploy with 405 and want POST.
+    s, b = call("GET", f"/deploy?uuid={app}&force=false")
+    if s == 405: s, b = call("POST", f"/deploy?uuid={app}&force=false")
+    print("CEO deploy queued:", s, "" if s < 300 else b[:300].decode(errors="replace"))
 else:
     print("Set CEO_INBOX_TOKEN and GITHUB_TOKEN in the Coolify UI and redeploy.")
 EOF
