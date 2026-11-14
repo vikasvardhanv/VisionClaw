@@ -23,7 +23,7 @@ V=$D/deploy/vps     # compose file + env files
 step() { printf '\n== %s\n' "$*"; }
 vps() {  # vps "<remote command>", stdin passes through
   (cd "$PN/ProjectNexus-github" && envcrypt run .sops.env -- sh -c \
-    'SSHPASS="$VPS_ROOT_SSH_PASSWORD" exec sshpass -e ssh -o StrictHostKeyChecking=no root@76.13.124.154 "$1"' _ "$1")
+    'SSHPASS="$VPS_ROOT_SSH_PASSWORD" exec sshpass -e ssh -o StrictHostKeyChecking=accept-new root@76.13.124.154 "$1"' _ "$1")
 }
 put_env() {  # put_env <file>: stdin -> $V/<file> on the VPS, mode 600
   vps "umask 077; cat > $V/$1 && echo \"$1: \$(grep -c = $V/$1) vars\""
@@ -81,7 +81,10 @@ step "5/6 ops server + CEO"
 vps "cp $D/ops/ops_server.py /opt/ops/ops_server.py && echo 'ops_server.py updated'"
 envcrypt run "$SOPS" -- sh -c \
   'printf "CEO_INBOX_URL=http://100.120.229.126:8791/chairman\nCEO_INBOX_TOKEN=%s\n" "$CEO_INBOX_TOKEN"' |
-  vps 'umask 077; cd /opt/ops && cp -p ops.secrets ops.secrets.bak.$(date +%s) && { grep -v "^CEO_INBOX_" ops.secrets; cat; } > s.new && chmod 600 s.new && mv s.new ops.secrets && docker compose up -d --build 2>&1 | tail -1'
+  vps 'umask 077; cd /opt/ops && cp -p ops.secrets ops.secrets.bak.$(date +%s) && { grep -v "^CEO_INBOX_" ops.secrets; cat; } > s.new &&
+    grep -q "^CEO_INBOX_TOKEN=." s.new && chmod 600 s.new && mv s.new ops.secrets || { echo "ops.secrets not updated" >&2; exit 1; }
+    ls -t ops.secrets.bak.* 2>/dev/null | tail -n +4 | xargs -r rm -f
+    docker compose up -d --build > /tmp/ops-up.log 2>&1 || { tail -30 /tmp/ops-up.log; exit 1; }; tail -1 /tmp/ops-up.log'
 envcrypt run "$SOPS" -- python3 - "$CEO_APP" <<'EOF'
 import json, os, sys, urllib.request
 base, tok, app = os.environ["COOLIFY_URL"].rstrip("/"), os.environ["COOLIFY_API_TOKEN"], sys.argv[1]
@@ -94,7 +97,7 @@ def call(method, path, body=None):
     except urllib.error.HTTPError as e: return e.code, e.read()
 s, b = call("PATCH", f"/applications/{app}/envs/bulk",
             {"data": [{"key": k, "value": os.environ[k]} for k in ("CEO_INBOX_TOKEN", "GITHUB_TOKEN")]})
-print("CEO env:", s, "" if s < 300 else b[:300].decode(errors="replace"))
+print("CEO env:", s)
 if s < 300:
     print("CEO deploy queued:", call("GET", f"/deploy?uuid={app}&force=false")[0])
 else:
@@ -113,7 +116,9 @@ echo "livekit signaling https://$LK_HOST: HTTP $lk (000 = unreachable)"
 vps 'for _ in $(seq 1 12); do l=$(docker logs vc-agent 2>&1 | grep -i "registered worker" | tail -1); [ -n "$l" ] && break; sleep 5; done
 if [ -n "$l" ]; then echo "agent: $l"; else echo "agent: no registered worker; last errors:"; docker logs vc-agent 2>&1 | grep -iE "error|Traceback" | tail -3; fi; true'
 # Room ticket with the chairman code: proves the code signs in and the gateway holds LiveKit keys.
-envcrypt run "$SOPS" -- sh -c 'curl -s -m 20 -X POST "https://$1/livekit-token" -H "Authorization: Bearer $VISIONCLAW_CHAIRMAN_CODE" -H "Content-Type: application/json" -d "{\"chairman\":true}"' _ "$HOST" |
+# Bearers go to curl on stdin (-H @-), never in argv where `ps` would show them.
+envcrypt run "$SOPS" -- sh -c 'printf "Authorization: Bearer %s\n" "$VISIONCLAW_CHAIRMAN_CODE" |
+  curl -s -m 20 -X POST "https://$1/livekit-token" -H @- -H "Content-Type: application/json" -d "{\"chairman\":true}"' _ "$HOST" |
   python3 -c 'import json,sys
 try:
     d = json.load(sys.stdin)
@@ -128,11 +133,14 @@ vps 'c=$(docker ps --format "{{.Names}}" | grep "^nexus_agent-'"$CEO_APP"'" | he
 # voice agent uses: with the chairman code alone, spawn mode answers with an instant
 # acknowledgement and delivers the result later over the app's WebSocket.
 echo "chairman turn (EDITH -> CEO, up to 200s)..."
-envcrypt run "$SOPS" -- sh -c 'curl -s -m 200 "https://$1/v1/chat/completions" -H "Authorization: Bearer $VISIONCLAW_SERVICE_TOKEN" -H "X-User-Id: chairman" -H "X-Chairman: 1" -H "Content-Type: application/json" -d "$2"' _ "$HOST" \
+envcrypt run "$SOPS" -- sh -c 'printf "Authorization: Bearer %s\n" "$VISIONCLAW_SERVICE_TOKEN" |
+  curl -s -m 200 "https://$1/v1/chat/completions" -H @- -H "X-User-Id: chairman" -H "X-Chairman: 1" -H "Content-Type: application/json" -d "$2"' _ "$HOST" \
   '{"messages":[{"role":"user","content":"EDITH, ask the CEO for a one-line status update and tell me what he said."}]}' |
   python3 -c 'import json,sys
-try: print("EDITH:", json.load(sys.stdin)["choices"][0]["message"]["content"])
-except Exception as e: print("chairman turn: no reply", type(e).__name__)' || echo "chairman turn: request failed"
+try: t = json.load(sys.stdin)["choices"][0]["message"]["content"]
+except Exception as e: print("chairman turn: no reply", type(e).__name__); sys.exit()
+# SPAWN_ACK in gateway/src/server.ts: the turn outran the 110s service budget.
+print("chairman turn: still running after the service budget (slow, not a pass)") if t.startswith("[task started]") else print("EDITH:", t)' || echo "chairman turn: request failed"
 
 cat <<MSG
 
