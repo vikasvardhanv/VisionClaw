@@ -80,7 +80,7 @@ struct SettingsView: View {
         }
 
         Section(header: Text("Chairman"), footer: Text(chairmanMode
-          ? "Claude takes your requests and gets them done through the CEO, GitHub and your servers. Merges and trades still wait for your tap in Telegram. Applies to the next call."
+          ? "EDITH takes your requests and gets them done through your apps, the CEO, GitHub and your servers. Merges and trades still wait for your tap in Telegram. Applies to the next call."
           : "The assistant works as usual. Applies to the next call.")) {
           Toggle("Chairman mode", isOn: $chairmanMode)
         }

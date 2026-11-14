@@ -17,15 +17,18 @@ Ground rules:
 
 const CHAIRMAN_SYSTEM_PROMPT = `${AGENT_SYSTEM_PROMPT}
 
-Chairman mode: the person speaking is the chairman who owns the company, and you act for them through the ops tools.
+You are EDITH, the chairman's personal operations AI. The person speaking owns the company. You get things done:
+take the request, pick the tools, carry it through to a result, and report back in one or two sentences.
+- Personal tasks (mail, calendar, messages, notes, research) go through the connected apps and your own tools.
 - ask_ceo hands an instruction to the CEO agent, which runs the business and executes through Agent Zero on Thor.
   Use it for anything addressed to the CEO, and for business work the CEO owns (content, revenue, missions, research).
-- Use the GitHub, Coolify, service health and trading tools directly for checks and for opening PRs.
+- Use the GitHub, Coolify, service health and trading tools directly for status checks and for opening PRs.
 - Merges and trades happen only after the chairman taps Approve in Telegram. After request_merge or a trade
   proposal, say it is waiting for their tap. Never say a merge or trade happened unless a tool result says so.
+- Never claim something is done without a tool result that shows it. If it failed, say what failed and the next step.
 - Relay what the CEO said in one or two spoken sentences, not its whole reply.`;
 
-/** An agent config the gateway owns. The chairman profile carries only the ops server. */
+/** An agent config the gateway owns. The chairman profile (EDITH) adds the ops server to the apps. */
 interface Profile {
   storeKey: "agentId" | "chairmanAgentId";
   name: string;
@@ -44,11 +47,11 @@ const DEFAULT_PROFILE: Profile = {
 
 const CHAIRMAN_PROFILE: Profile = {
   storeKey: "chairmanAgentId",
-  name: "VisionClaw Chairman Agent",
+  name: "EDITH (VisionClaw chairman)",
   system: CHAIRMAN_SYSTEM_PROMPT,
-  servers: () => [{ type: "url" as const, name: "ops", url: config.opsMcpUrl! }],
+  servers: () => [...mcpServers(), { type: "url" as const, name: "ops", url: config.opsMcpUrl! }],
   tools: () => [
-    { type: "agent_toolset_20260401" as const },
+    ...agentTools(),
     // always_allow is safe here only because the ops server itself refuses merges
     // and trades without the chairman's Telegram tap.
     { type: "mcp_toolset" as const, mcp_server_name: "ops",
@@ -224,11 +227,15 @@ export async function ensureUser(
   const verifiedAt = u.sessionId ? (sessionVerifiedAt.get(u.sessionId) ?? 0) : 0;
   const needsCheck = Date.now() - verifiedAt > RECONCILE_TTL_MS;
   if (!u.sessionId || (needsCheck && !(await sessionUsable(u.sessionId)))) {
+    // EDITH also mounts the chairman's own vault, so connected apps keep working.
+    // ponytail: read at session creation; an app vault created later reaches EDITH
+    // on the next session rebuild.
+    const appVault = chairman ? (await userResources(realUserId)).vaultId : undefined;
     const session = await anthropic.beta.sessions.create({
       agent: agentId,
       environment_id: environmentId,
       title: `visionclaw:${userId}`,
-      vault_ids: [u.vaultId],
+      vault_ids: appVault ? [u.vaultId, appVault] : [u.vaultId],
     });
     u.sessionId = session.id;
     sessionVerifiedAt.set(session.id, Date.now());
