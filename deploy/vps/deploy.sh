@@ -85,7 +85,9 @@ envcrypt run "$SOPS" -- sh -c \
     grep -q "^CEO_INBOX_TOKEN=." s.new && chmod 600 s.new && mv s.new ops.secrets || { echo "ops.secrets not updated" >&2; exit 1; }
     ls -t ops.secrets.bak.* 2>/dev/null | tail -n +4 | xargs -r rm -f
     docker compose up -d --build > /tmp/ops-up.log 2>&1 || { tail -30 /tmp/ops-up.log; exit 1; }; tail -1 /tmp/ops-up.log'
-envcrypt run "$SOPS" -- python3 - "$CEO_APP" <<'EOF'
+# The Coolify API token in $SOPS is stale (401); the live one is in viktron-backend's sops
+# file. Nesting envcrypt lets that file's COOLIFY_API_TOKEN override; COOLIFY_URL stays.
+envcrypt run "$SOPS" -- envcrypt run "$HOME/IdeaProjects/${COOLIFY_SOPS:-viktron-backend}/.sops.env" -- python3 - "$CEO_APP" <<'EOF'
 import json, os, sys, urllib.request
 base, tok, app = os.environ["COOLIFY_URL"].rstrip("/"), os.environ["COOLIFY_API_TOKEN"], sys.argv[1]
 def call(method, path, body=None):
