@@ -129,10 +129,15 @@ try:
     d = json.load(sys.stdin)
     print("room ticket:", d["url"], d["room"]) if "token" in d else print("room ticket: failed", d.get("error"))
 except Exception as e: print("room ticket: bad response", type(e).__name__)' || echo "room ticket: request failed"
-echo "Waiting 90s for the CEO container..."; sleep 90
-vps "docker exec ops-mcp python -c \"import os,httpx
-try: print('ops -> CEO inbox:', httpx.post(os.environ['CEO_INBOX_URL'], json={'text': ''}, headers={'Authorization': 'Bearer '+os.environ['CEO_INBOX_TOKEN']}, timeout=10).status_code, '(400 = good)')
-except Exception as e: print('ops -> CEO inbox: unreachable', type(e).__name__)\"" || echo "ops -> CEO inbox: check failed"
+# The CEO pulls a big image and starts its inbox late: 90s was too short and
+# reported "unreachable" for a CEO that came up a minute later. Poll up to 5 min.
+echo "Waiting for the CEO inbox (up to 5 min)..."
+vps "docker exec ops-mcp python -c \"import os,time,httpx
+err = 'none'
+for _ in range(30):
+    try: print('ops -> CEO inbox:', httpx.post(os.environ['CEO_INBOX_URL'], json={'text': ''}, headers={'Authorization': 'Bearer '+os.environ['CEO_INBOX_TOKEN']}, timeout=10).status_code, '(400 = good)'); break
+    except Exception as e: err = type(e).__name__; time.sleep(10)
+else: print('ops -> CEO inbox: unreachable after 5 min', err)\"" || echo "ops -> CEO inbox: check failed"
 vps 'c=$(docker ps --format "{{.Names}}" | grep "^nexus_agent-'"$CEO_APP"'" | head -1); docker exec "$c" sh -c '"'"'git ls-remote -q "https://x-access-token:$GITHUB_TOKEN@github.com/vikasvardhanv/ProjectNexus.git" HEAD >/dev/null 2>&1 && echo "CEO repo clone: OK" || echo "CEO repo clone: FAIL"'"'"'' || echo "CEO repo clone: check failed"
 # A real chairman turn. It goes through the service token + X-User-Id, the same path the
 # voice agent uses: with the chairman code alone, spawn mode answers with an instant
