@@ -14,6 +14,7 @@ Single door for agents to reach GitHub, the VPS and Thor. Fixed tools, no raw sh
 | `trading_digest` | Runs the morning digest now, sends it to Telegram, returns the text. |
 | `trading_propose` | Runs one trade proposal now and returns what happened. Places nothing. |
 | `ask_ceo` | Sends an instruction to the ProjectNexus CEO as the chairman and returns the CEO's reply. The CEO mirrors the exchange to the chairman's Telegram. |
+| `ceo_missions` | Read only. Lists the CEO's recent missions (status, type, description), newest first, so the chairman can hear what is in progress. |
 
 ## Approval flow
 

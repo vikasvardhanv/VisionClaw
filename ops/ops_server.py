@@ -178,6 +178,28 @@ async def ask_ceo(instruction: str) -> str:
     return r.json().get("reply", "")
 
 
+@mcp.tool()
+async def ceo_missions(limit: int = 5) -> str:
+    """Reports what the CEO agent is working on and how the chairman's tasks are going,
+    newest first. Read only."""
+    url, tok = os.environ.get("CEO_INBOX_URL"), os.environ.get("CEO_INBOX_TOKEN")
+    if not (url and tok):
+        return "CEO inbox is not configured on the ops server (CEO_INBOX_URL, CEO_INBOX_TOKEN)."
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.get(f"{url}/missions", params={"limit": limit}, headers={"Authorization": f"Bearer {tok}"})
+    except httpx.HTTPError as e:
+        return f"Could not reach the CEO: {type(e).__name__}."
+    if r.status_code != 200:
+        return f"The CEO inbox returned HTTP {r.status_code}."
+    ms = r.json().get("missions", [])
+    if not ms:
+        return "The CEO has no missions on record."
+    return "\n".join(
+        f"{m.get('status')} | {m.get('type')} | {m.get('description')} ({m.get('id')}, {m.get('updated')})" for m in ms
+    )
+
+
 @mcp.custom_route("/approve", methods=["POST"])
 async def approve(request: Request):
     """Chairman only: {"repo","pr","decision":"approve"|"reject"} with CHAIRMAN_TOKEN."""
