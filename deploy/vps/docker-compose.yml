@@ -1,0 +1,78 @@
+# VisionClaw voice stack on the VPS: LiveKit + gateway + voice agent.
+# Lives at /opt/visionclaw/deploy/vps; deploy.sh (run from the Mac) ships the code,
+# writes the *.env files (secrets only, mode 600) and runs `docker compose up -d --build`.
+# Gateway data sits at /opt/visionclaw/data, outside the tree deploy.sh replaces.
+name: visionclaw
+
+services:
+  livekit:
+    image: livekit/livekit-server:v1.8.4
+    container_name: vc-livekit
+    restart: unless-stopped
+    command: --config /etc/livekit.yaml
+    env_file: livekit.env # LIVEKIT_KEYS
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml:ro
+    ports:
+      - "7881:7881/tcp"
+      - "50000-50100:50000-50100/udp"
+    networks: [coolify]
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=coolify
+      - traefik.http.routers.visionclaw-livekit.rule=Host(`livekit.76-13-124-154.sslip.io`)
+      - traefik.http.routers.visionclaw-livekit.entrypoints=https
+      - traefik.http.routers.visionclaw-livekit.tls=true
+      - traefik.http.routers.visionclaw-livekit.tls.certresolver=letsencrypt
+      - traefik.http.routers.visionclaw-livekit.service=visionclaw-livekit
+      - traefik.http.services.visionclaw-livekit.loadbalancer.server.port=7880
+
+  gateway:
+    build: ../../gateway
+    container_name: vc-gateway
+    restart: unless-stopped
+    # ANTHROPIC_API_KEY GATEWAY_TOKENS GATEWAY_SERVICE_TOKEN STATE_SECRET
+    # LIVEKIT_API_KEY LIVEKIT_API_SECRET OPS_AGENT_TOKEN
+    env_file: gateway.env
+    environment:
+      PORT: "8788"
+      STORE_PATH: /data/gateway-store.json
+      PUBLIC_BASE_URL: https://visionclaw.76-13-124-154.sslip.io
+      LIVEKIT_URL: wss://livekit.76-13-124-154.sslip.io
+      OPS_MCP_URL: https://ops.76-13-124-154.sslip.io/mcp
+      CHAIRMAN_USER_ID: chairman
+      # Sign-in is the static chairman code only; Google OAuth is not configured here.
+      REGISTRATION_OPEN: "false"
+      AGENT_MODEL: claude-sonnet-5
+      AGENT_EFFORT: none
+      QUICK_ANSWER_TIMEOUT_MS: "45000"
+    volumes:
+      - ../../data:/data
+    networks: [coolify]
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=coolify
+      - traefik.http.routers.visionclaw.rule=Host(`visionclaw.76-13-124-154.sslip.io`)
+      - traefik.http.routers.visionclaw.entrypoints=https
+      - traefik.http.routers.visionclaw.tls=true
+      - traefik.http.routers.visionclaw.tls.certresolver=letsencrypt
+      - traefik.http.routers.visionclaw.service=visionclaw
+      - traefik.http.services.visionclaw.loadbalancer.server.port=8788
+
+  agent:
+    build: ../../agent
+    container_name: vc-agent
+    restart: unless-stopped
+    # LIVEKIT_API_KEY LIVEKIT_API_SECRET GATEWAY_SERVICE_TOKEN GOOGLE_API_KEY OPENAI_API_KEY
+    env_file: agent.env
+    environment:
+      LIVEKIT_URL: ws://vc-livekit:7880
+      GATEWAY_URL: http://vc-gateway:8788
+      GEMINI_MODEL: gemini-2.5-flash-native-audio-preview-12-2025
+      OPENAI_REALTIME_MODEL: gpt-realtime-2.1
+    depends_on: [livekit, gateway]
+    networks: [coolify]
+
+networks:
+  coolify:
+    external: true

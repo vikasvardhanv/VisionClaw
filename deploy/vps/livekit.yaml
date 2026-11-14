@@ -1,0 +1,12 @@
+# Self-hosted LiveKit for VisionClaw. API keys come from the LIVEKIT_KEYS env var
+# (livekit.env, written by deploy.sh), never from this file.
+port: 7880
+rtc:
+  tcp_port: 7881
+  port_range_start: 50000
+  port_range_end: 50100
+  # Advertise the VPS public IP; no STUN lookup.
+  use_external_ip: false
+  node_ip: 76.13.124.154
+logging:
+  level: info
